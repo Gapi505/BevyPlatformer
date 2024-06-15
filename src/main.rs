@@ -1,17 +1,19 @@
-use bevy::asset::io::memory::Value::Vec;
 use bevy::prelude::*;
 use bevy::math::bounding::{
     Aabb2d,
     BoundingVolume,
     IntersectsVolume
 };
+use bevy::sprite::{Mesh2d, Mesh2dHandle};
 
 
 const PLAYER_SPEED: f32 = 5.;
-const PLAYER_ACCEL: f32 = 0.07;
-const PLAYER_DECEL: f32 = 0.1;
+const PLAYER_ACCEL: f32 = 0.05;
+const PLAYER_DECEL: f32 = 0.08;
 const PLAYER_JUMP_STRENGTH:f32 = 8.;
 const GRAVITY:f32 = -0.2;
+
+const SQUASH_SNAPPINESS:f32 = 0.05;
 
 const CAMERA_ACCEL: f32 = 0.1;
 
@@ -23,18 +25,19 @@ impl Plugin for SpawnPlugin{
         app.add_systems(Startup,(
             spawn_camera,
             spawn_player,
-            spawn_block));
+            spawn_block))
+            .insert_resource(Time::<Fixed>::from_hz(144.));;
     }
 }
 
 impl Plugin for UpdatePlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update,((control_player,
-                                 gravitate,
-                                 move_bodies,
-                                 handle_collisions,
-                                 camera_follow
-                                ).chain(),
+        app.add_systems(FixedUpdate,((control_player,
+                                 (gravitate,
+                                  move_bodies,
+                                  handle_collisions).chain().after(control_player),
+                                camera_follow.after(move_bodies),
+                                 player_effects,),
                                 project_transforms
         ).chain());
     }
@@ -46,6 +49,10 @@ fn main() {
 
 #[derive(Component)]
 struct Position(Vec2);
+#[derive(Component)]
+struct Rotation(f32);
+#[derive(Component)]
+struct ZOrder(f32);
 #[derive(Component)]
 struct Shape(Vec2);
 #[derive(Component)]
@@ -72,6 +79,8 @@ struct Camera;
 #[derive(Component)]
 struct Gravitated;
 #[derive(Component)]
+struct Grounded(bool);
+#[derive(Component)]
 struct Collider;
 
 #[derive(Bundle)]
@@ -79,7 +88,9 @@ struct BlockBundle{
     block: Block,
     shape: Shape,
     position: Position,
-    collider: Collider
+    collider: Collider,
+    rotation: Rotation,
+    z_order: ZOrder
 }
 
 impl BlockBundle {
@@ -88,7 +99,9 @@ impl BlockBundle {
             block:Block,
             shape:Shape(shape),
             position:Position(position),
-            collider:Collider
+            collider:Collider,
+            rotation:Rotation(0.),
+            z_order: ZOrder(0.)
         }
     }
 }
@@ -101,6 +114,9 @@ struct PlayerBundle {
     gravity: Gravity,
     velocity: Velocity,
     gravitated: Gravitated,
+    grounded: Grounded,
+    rotation: Rotation,
+    z_order: ZOrder
 }
 impl PlayerBundle{
     fn new(position: Vec2, shape: Vec2) -> Self{
@@ -112,6 +128,9 @@ impl PlayerBundle{
             vis_shape: VisShape(shape),
             gravity: Gravity(Vec2::new(0.,GRAVITY)),
             velocity: Velocity(Vec2::new(0.,2.)),
+            grounded: Grounded(false),
+            rotation: Rotation(0.),
+            z_order: ZOrder(0.1)
         }
     }
 }
@@ -121,7 +140,9 @@ fn spawn_camera(
     commands.spawn((Camera2dBundle::default(),
                     Position(Vec2::new(0.,0.)),
                     Velocity(Vec2::new(0.,0.)),
-                    Camera
+                    Camera,
+                    Rotation(0.),
+                    ZOrder(0.0)
     ));
 }
 fn spawn_player(
@@ -190,12 +211,18 @@ fn gravitate(
 }
 
 fn handle_collisions(
-    mut player: Query<(&mut Position, &mut Velocity, &Shape), With<Player>>,
+    mut player: Query<(&mut Position, &mut Velocity, &Shape, &mut Grounded, &mut VisShape), With<Player>>,
     colliders: Query<(&Position,&Shape),(With<Collider>, Without<Player>)>
 ){
     for (position, shape) in & colliders{
-        for (mut p_position, mut p_velocity, p_shape) in player.get_single_mut(){
-            let p_aabb = Aabb2d::new(p_position.0, p_shape.0/2.0);
+        for (mut p_position,
+            mut p_velocity,
+            p_shape,
+            mut grounded,
+            mut vis_shape)
+        in player.get_single_mut(){
+
+            let p_aabb = Aabb2d::new(p_position.0, vis_shape.0/2.0);
             let aabb = Aabb2d::new(position.0, shape.0/2.0);
             let collision = collide(p_aabb,aabb);
             if !collision.is_none(){
@@ -208,6 +235,11 @@ fn handle_collisions(
                     Collision::Bottom => {
                         p_velocity.0.y = 0.;
                         p_position.0.y += offset.y;
+                        if grounded.0 == false{
+                            vis_shape.0 = Vec2::new(80.,80.);
+                            p_position.0.y -= 10.;
+                        }
+                        grounded.0 = true
                     },
                     Collision::Left=> {
                         p_velocity.0.x = 0.;
@@ -218,25 +250,28 @@ fn handle_collisions(
                         p_position.0.x -= offset.x;
                     },
                 }
+            }else {
+                grounded.0 = false
             }
         }
     }
 }
 
 fn control_player(
-    mut player: Query<(&mut Velocity), With<Player>>,
+    mut player: Query<(&mut Velocity, &mut VisShape), With<Player>>,
     kb_input: Res<ButtonInput<KeyCode>>
 ){
-    if let Ok(mut velocity) = player.get_single_mut(){
+    if let Ok((mut velocity, mut vis_shape)) = player.get_single_mut(){
         let mut target_x_speed = 0.;
         if kb_input.pressed(KeyCode::KeyD){
-            target_x_speed = PLAYER_SPEED;
+            target_x_speed += PLAYER_SPEED;
         }
         if kb_input.pressed(KeyCode::KeyA){
-            target_x_speed = -PLAYER_SPEED;
+            target_x_speed += -PLAYER_SPEED;
         }
         if kb_input.just_pressed(KeyCode::KeyW) || kb_input.just_pressed(KeyCode::Space){
-            velocity.0.y = PLAYER_JUMP_STRENGTH
+            velocity.0.y = PLAYER_JUMP_STRENGTH;
+            vis_shape.0 = Vec2::new(80.,70.)
         }
 
         if target_x_speed.abs() < velocity.0.x.abs(){
@@ -287,12 +322,35 @@ fn camera_follow(
 
 
 fn project_transforms(
-    mut positionables: Query<(&mut Transform, &Position)>
+    mut transformables: Query<(&mut Transform, &Position, &Rotation, &ZOrder)>,
 ){
-    for (mut transform,position) in &mut positionables{
-        transform.translation = position.0.extend(0.)
+    for (mut transform,position,rotation, z_order) in &mut transformables {
+        transform.translation = position.0.extend(z_order.0);
+        transform.rotation = Quat::from_axis_angle(Vec3::Z,rotation.0);
     }
 }
+fn player_effects(
+    mut player: Query<(&mut VisShape, &Shape, &Mesh2dHandle, &mut Rotation, &Velocity), With<Player>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+){
+    match player.get_single_mut() {
+        Ok((mut vis_shape, shape, mesh_handle, mut rotation, velocity)) => {
+            //Squash
+            let rectangle_mesh = Mesh::from(Rectangle::new(vis_shape.0.x,vis_shape.0.y));
+            let mut mesh = meshes.get_mut(mesh_handle.id()).unwrap();
+            *mesh = rectangle_mesh;
+            vis_shape.0 = vlerp(vis_shape.0, shape.0, SQUASH_SNAPPINESS);
+            //Rotation
+            let angle = flerp(0.,-0.3,velocity.0.x/PLAYER_SPEED);
+            rotation.0 = angle
+        }
+        Err(e) => {
+            println!("Query failed: {:?}", e);
+        }
+    }
+}
+
+
 fn flerp(a:f32,b:f32,t:f32) -> f32{
     a + t * (b - a)
 }
